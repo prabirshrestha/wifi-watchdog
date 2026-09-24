@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# wifi-watchdog: reconnect a NetworkManager Wi-Fi connection when it is down.
+#
+# NetworkManager before 1.58 asks a secret agent for a new PSK after one failed
+# 4-way handshake instead of retrying the saved one (fixed upstream in commit
+# 746a5902a). At the GDM login screen nobody answers, so the connection stays
+# down. The timer installed here runs `nmcli connection up` every minute while
+# the connection is not active.
+set -euo pipefail
+
+# Bump on every change. `update` replaces this file with the newest version.
+VERSION=0.1.0
+NAME=wifi-watchdog
+URL=https://raw.githubusercontent.com/prabirshrestha/$NAME/main/$NAME
+BIN=$(readlink -f "$0")
+CONF=/etc/default/$NAME
+SERVICE=/etc/systemd/system/$NAME.service
+TIMER=/etc/systemd/system/$NAME.timer
+
+usage() {
+  cat <<EOF
+usage: $NAME COMMAND
+
+  list                       show saved Wi-Fi connections
+  set-password [CONNECTION]  save the Wi-Fi password for all users (asks for it)
+  install [CONNECTION]       start watching CONNECTION (default: active Wi-Fi)
+  status                     show the timer and recent log lines
+  update                     download the newest version and keep the settings
+  uninstall                  stop watching and remove all files, including $BIN
+  version                    print the version ($VERSION)
+EOF
+}
+
+die() {
+  echo "$NAME: $*" >&2
+  exit 1
+}
+
+need_nmcli() {
+  command -v nmcli >/dev/null || die "nmcli not found; NetworkManager is required"
+}
+
+need_root() {
+  [ "$(id -u)" -eq 0 ] || die "run as root: sudo $NAME $*"
+}
+
+# Prints $1, or the active Wi-Fi connection, after checking it is Wi-Fi.
+resolve_conn() {
+  local conn=${1:-}
+  if [ -z "$conn" ]; then
+    conn=$(nmcli -t -f NAME,TYPE connection show --active |
+      awk -F: '$2 == "802-11-wireless" { print $1; exit }')
+    [ -n "$conn" ] || die "no active Wi-Fi connection; pass the connection name"
+  fi
+  case $conn in *[\'$'\n']*) die "connection name must not contain ' or a newline" ;; esac
+  [ "$(nmcli -g connection.type connection show "$conn" 2>/dev/null)" = 802-11-wireless ] ||
+    die "'$conn' is not a saved Wi-Fi connection; see: $NAME list"
+  echo "$conn"
+}
+
+# True when the saved password is available before anyone logs in.
+ready_before_login() {
+  case $(nmcli -g 802-11-wireless-security.psk-flags connection show "$1") in
+    0 | "0 (none)" | "") ;;
+    *) return 1 ;;
+  esac
+  [ -z "$(nmcli -g connection.permissions connection show "$1")" ]
+}
+
+cmd_list() {
+  local watched="" uuid type name
+  [ -r "$CONF" ] && watched=$(sed -n "s/^CONNECTION='\(.*\)'$/\1/p" "$CONF")
+  printf '%-32s %-7s %-8s %s\n' NAME ACTIVE WATCHED "READY BEFORE LOGIN"
+  # UUIDs never contain ':', so terse output splits safely.
+  nmcli -g UUID,TYPE connection show | while IFS=: read -r uuid type; do
+    [ "$type" = 802-11-wireless ] || continue
+    name=$(nmcli -g connection.id connection show "$uuid")
+    printf '%-32s %-7s %-8s %s\n' "$name" \
+      "$([ "$(nmcli -g GENERAL.STATE connection show "$uuid")" = activated ] && echo yes || echo no)" \
+      "$([ "$name" = "$watched" ] && echo yes || echo no)" \
+      "$(ready_before_login "$uuid" && echo yes || echo "no (run: sudo $NAME set-password)")"
+  done
+}
+
+# The password is read from the terminal without echo and sent to nmcli on
+# stdin, so it is never in shell history or in a process argument list.
+cmd_set_password() {
+  need_root set-password "$@"
+  local conn uuid pw pw2
+  conn=$(resolve_conn "${1:-}")
+  uuid=$(nmcli -g connection.uuid connection show "$conn")
+  IFS= read -rsp "Wi-Fi password for '$conn': " pw </dev/tty
+  echo >/dev/tty
+  IFS= read -rsp "Repeat password: " pw2 </dev/tty
+  echo >/dev/tty
+  [ "$pw" = "$pw2" ] || die "passwords do not match"
+  if { [ ${#pw} -lt 8 ] || [ ${#pw} -gt 63 ]; } && ! [[ $pw =~ ^[0-9A-Fa-f]{64}$ ]]; then
+    die "a WPA password has 8 to 63 characters, or 64 hex digits"
+  fi
+
+  # printf is a shell builtin, so the password is not a command argument.
+  printf 'remove connection.permissions\nset 802-11-wireless-security.psk-flags 0\nset 802-11-wireless-security.psk %s\nsave persistent\nquit\n' "$pw" |
+    nmcli connection edit uuid "$uuid" >/dev/null 2>&1 || true
+
+  if [ "$(nmcli -e no -s -g 802-11-wireless-security.psk connection show uuid "$uuid")" != "$pw" ] ||
+    ! ready_before_login "$uuid"; then
+    die "could not save the password for '$conn'"
+  fi
+  echo "$NAME: password for '$conn' saved for all users"
+}
+
+cmd_install() {
+  need_root install "$@"
+  local conn
+  conn=$(resolve_conn "${1:-}")
+  ready_before_login "$conn" ||
+    echo "$NAME: warning: '$conn' cannot connect before login; run: sudo $NAME set-password '$conn'" >&2
+
+  printf "CONNECTION='%s'\n" "$conn" >"$CONF"
+
+  cat >"$SERVICE" <<EOF
+[Unit]
+Description=Reconnect Wi-Fi when it is down
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=$CONF
+ExecStart="$BIN" check
+EOF
+
+  cat >"$TIMER" <<EOF
+[Unit]
+Description=Check Wi-Fi every minute
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now "$NAME.timer" >/dev/null
+  echo "$NAME: watching '$conn'. Logs: journalctl -t $NAME"
+}
+
+# Run by the timer.
+cmd_check() {
+  [ -n "${CONNECTION:-}" ] || die "CONNECTION is not set"
+  [ "$(nmcli -g GENERAL.STATE connection show "$CONNECTION" 2>/dev/null)" = activated ] && return
+  logger -t "$NAME" "'$CONNECTION' not active, reconnecting"
+  if nmcli --wait 45 connection up "$CONNECTION" >/dev/null 2>&1; then
+    logger -t "$NAME" "'$CONNECTION' reconnected"
+  else
+    logger -t "$NAME" "'$CONNECTION' reconnect failed, retrying next run"
+  fi
+}
+
+cmd_status() {
+  if [ ! -f "$TIMER" ]; then
+    echo "$NAME: not installed"
+    return
+  fi
+  cat "$CONF" 2>/dev/null || true
+  systemctl --no-pager list-timers "$NAME.timer" || true
+  journalctl --no-pager -t "$NAME" -n 10 || true
+}
+
+cmd_update() {
+  need_root update
+  local tmp new
+  tmp=$(mktemp)
+  # shellcheck disable=SC2064 # expand now; tmp is local
+  trap "rm -f '$tmp'" EXIT
+  curl -fsSL "$URL" -o "$tmp" || die "download failed: $URL"
+  bash -n "$tmp" || die "downloaded file is not a valid script"
+  new=$(sed -n 's/^VERSION=//p' "$tmp")
+  [ -n "$new" ] || die "downloaded file has no VERSION"
+  if [ "$new" = "$VERSION" ]; then
+    echo "$NAME: already at $VERSION"
+    return
+  fi
+  install -m 755 "$tmp" "$BIN" # new inode; this running copy is not changed
+  # Rewrite the units with the new version, for the same connection.
+  if [ -r "$CONF" ]; then
+    # shellcheck disable=SC1090
+    (. "$CONF" && "$BIN" install "$CONNECTION")
+  fi
+  echo "$NAME: updated $VERSION -> $new"
+}
+
+cmd_uninstall() {
+  need_root uninstall
+  systemctl disable --now "$NAME.timer" >/dev/null 2>&1 || true
+  rm -f "$TIMER" "$SERVICE" "$CONF" "$BIN"
+  systemctl daemon-reload
+  systemctl reset-failed "$NAME.service" "$NAME.timer" >/dev/null 2>&1 || true
+  echo "$NAME: uninstalled"
+}
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case $cmd in
+  list) need_nmcli; cmd_list ;;
+  set-password) need_nmcli; cmd_set_password "$@" ;;
+  install) need_nmcli; cmd_install "$@" ;;
+  check) need_nmcli; cmd_check ;;
+  status) cmd_status ;;
+  update) cmd_update ;;
+  uninstall) cmd_uninstall ;;
+  version | --version) echo "$NAME $VERSION" ;;
+  -h | --help | help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
