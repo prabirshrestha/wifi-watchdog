@@ -45,7 +45,7 @@ git clone https://github.com/prabirshrestha/wifi-watchdog.git
 sudo install -m 755 wifi-watchdog/wifi-watchdog /usr/local/bin/
 ```
 
-The timer runs the script from the path you start `install` with, so keep it there.
+Run `install` from where the script will stay, such as `/usr/local/bin`. The timer runs the script from that path, so do not move or delete it afterwards.
 
 Show the saved Wi-Fi connections:
 
@@ -109,3 +109,7 @@ sudo wifi-watchdog uninstall
 ## Releasing
 
 Change `VERSION` in the script on every change. `update` compares it with the installed version.
+
+## License
+
+MIT
